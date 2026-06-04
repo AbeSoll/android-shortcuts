@@ -6,29 +6,25 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.RingtoneManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.CountDownTimer
-import android.os.PowerManager
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import java.util.Locale
 
+/**
+ * Custom Full-Screen Alert Activity that rings when the automation timer finishes.
+ * Designed to bypass strict OEM background restrictions by acting as an Alarm.
+ */
 class TimerAlertActivity : Activity() {
 
-    private var countDownTimer: CountDownTimer? = null
     private var mediaPlayer: MediaPlayer? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private lateinit var timerText: TextView
-    private var timerSeconds: Int = 5
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ── 1. Force Screen & Lockscreen Bypass ───────────────────────
+        // ── 1. Force Screen Wake & Lockscreen Bypass ───────────────────────
         window.addFlags(
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
                     WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
@@ -43,80 +39,51 @@ class TimerAlertActivity : Activity() {
             keyguardManager.requestDismissKeyguard(this, null)
         }
 
-        // ── 2. Acquire CPU WakeLock (Prevent Doze Sleep) ──────────────
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TaskFlow::TimerTickLock")
-        wakeLock?.acquire(10 * 60 * 1000L) // Max 10 mins protection
-
-        // ── 3. UI Construction ────────────────────────────────────────
-        timerSeconds = intent.getIntExtra("timerSeconds", 5)
-        
+        // ── 2. UI Construction (Big Stop Button) ───────────────────────────
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = android.view.Gravity.CENTER
-            setBackgroundColor(0xFF0A0A0A.toInt()) 
+            setBackgroundColor(0xFF0A0A0A.toInt()) // Deep Dark background
             setPadding(32, 32, 32, 32)
         }
 
         val titleText = TextView(this).apply {
-            text = "TASKFLOW TIMER"
-            textSize = 18f
-            setTextColor(0xFF00E5FF.toInt()) 
+            text = "ALARM TUGASAN"
+            textSize = 24f
+            setTextColor(0xFF00E5FF.toInt()) // Electric Blue
             gravity = android.view.Gravity.CENTER
         }
 
-        timerText = TextView(this).apply {
-            text = formatTime(timerSeconds)
-            textSize = 80f
+        val msgText = TextView(this).apply {
+            text = "Bateri Mencapai Sasaran!"
+            textSize = 18f
             setTextColor(0xFFFFFFFF.toInt())
             gravity = android.view.Gravity.CENTER
-            setPadding(0, 48, 0, 48)
+            setPadding(0, 24, 0, 64)
         }
 
         val stopButton = Button(this).apply {
             text = "STOP ALARM"
-            textSize = 24f
+            textSize = 28f
             setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFFFF5252.toInt()) 
-            setPadding(64, 32, 64, 32)
+            setBackgroundColor(0xFFFF5252.toInt()) // Red accent
+            setPadding(64, 48, 64, 48)
             setOnClickListener {
                 stopAlarmAndFinish()
             }
         }
 
         layout.addView(titleText)
-        layout.addView(timerText)
+        layout.addView(msgText)
         layout.addView(stopButton)
 
         setContentView(layout)
 
-        startTimer()
+        // ── 3. Start Ringing ───────────────────────────────────────────────
+        playAlarm()
     }
 
-    private fun startTimer() {
-        countDownTimer = object : CountDownTimer(timerSeconds * 1000L, 1000) {
-            override fun onTick(millisUntilFinished: Long) {
-                val secondsRemaining = (millisUntilFinished / 1000).toInt()
-                timerText.text = formatTime(secondsRemaining)
-            }
-
-            override fun onFinish() {
-                timerText.text = "00:00"
-                
-                // ── 4. Wake Screen AGAIN for Ringing ───────────────────
-                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-                val ringLock = powerManager.newWakeLock(
-                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                    "TaskFlow::RingLock"
-                )
-                ringLock.acquire(3 * 60 * 1000L) 
-
-                playAlarmSound()
-            }
-        }.start()
-    }
-
-    private fun playAlarmSound() {
+    private fun playAlarm() {
         try {
             val alertUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
@@ -139,38 +106,20 @@ class TimerAlertActivity : Activity() {
     }
 
     private fun stopAlarmAndFinish() {
-        cleanup()
-        finish()
-    }
-
-    private fun cleanup() {
-        countDownTimer?.cancel()
-        countDownTimer = null
-        
         mediaPlayer?.apply {
             if (isPlaying) stop()
             release()
         }
         mediaPlayer = null
-
-        if (wakeLock?.isHeld == true) {
-            wakeLock?.release()
-        }
-        wakeLock = null
-    }
-
-    private fun formatTime(seconds: Int): String {
-        val minutes = seconds / 60
-        val remainingSeconds = seconds % 60
-        return String.format(Locale.getDefault(), "%02d:%02d", minutes, remainingSeconds)
+        finish()
     }
 
     override fun onDestroy() {
-        cleanup()
+        mediaPlayer?.release()
         super.onDestroy()
     }
 
     override fun onBackPressed() {
-        stopAlarmAndFinish()
+        // Prevent accidental dismissal via back button
     }
 }

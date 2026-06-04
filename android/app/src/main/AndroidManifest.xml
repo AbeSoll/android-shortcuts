@@ -20,6 +20,12 @@
     <!-- Required for high-priority full-screen alerts (Apple Shortcuts style) -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
+    <!-- Required for exact alarm scheduling (API 31+) -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Required for exact alarm scheduling without user prompt (API 33+) -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
     <!-- Required to set a timer/alarm natively (Apple Shortcuts style) -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
@@ -57,14 +63,14 @@
             android:exported="false"
             android:foregroundServiceType="specialUse" />
 
-        <!-- ── TimerAlertActivity (Custom Alarm UI) ───────────────── -->
+        <!-- ── Timer Alert Activity (Custom Alarm UI) ──────────────── -->
         <activity
             android:name=".TimerAlertActivity"
-            android:exported="false"
-            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
-            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen" />
+            android:launchMode="singleTop"
+            android:exported="false" />
 
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

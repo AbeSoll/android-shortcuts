@@ -11,7 +11,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -20,10 +22,8 @@ import org.json.JSONObject
 /**
  * A ForegroundService that monitors the device battery state in real-time.
  *
- * This service is elevated to Foreground status to survive Doze mode and
- * aggressive OEM task killers (like ColorOS). It uses a WakeLock inside
- * the BroadcastReceiver to ensure the CPU is awake enough to process
- * battery events even when the screen is OFF.
+ * Updated Architecture: Countdown is handled internally while holding a WakeLock,
+ * then a custom Full-Screen Intent is fired to bypass ColorOS restrictions.
  */
 class BatteryMonitorService : Service() {
 
@@ -32,29 +32,23 @@ class BatteryMonitorService : Service() {
 
         private const val TAG = "BatteryMonitorService"
         private const val NOTIFICATION_CHANNEL_ID = "taskflow_battery_monitor"
-        private const val ALARM_NOTIFICATION_CHANNEL_ID = "taskflow_alarm_channel"
+        private const val ALARM_NOTIFICATION_CHANNEL_ID = "taskflow_alarm_channel_v2"
         private const val NOTIFICATION_ID = 1001
-        private const val ALARM_NOTIFICATION_ID = 1002
+        private const val ALARM_NOTIFICATION_ID = 999
     }
 
     private var targetPercentage: Int = 90
-    private var condition: String = "equals" // equals, risesAbove, fallsBelow
+    private var condition: String = "equals"
     private var requireCharging: Boolean = true
     private var timerSeconds: Int = 5
     
-    // State machine to prevent spamming
     private var lastBatteryLevel: Int = -1
 
-    /**
-     * BroadcastReceiver that listens to battery state changes.
-     */
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != Intent.ACTION_BATTERY_CHANGED) return
 
-            // ── Acquire CPU WakeLock ──────────────────────────────────────
-            // Crucial: Hold CPU for a few seconds to ensure we process the logic
-            // while the device is in deep sleep/Doze mode.
+            // Acquire short WakeLock to process the battery change
             val powerManager = context?.getSystemService(Context.POWER_SERVICE) as PowerManager
             val cpuLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TaskFlow::BatteryCheck")
             cpuLock.acquire(5000L) 
@@ -68,46 +62,42 @@ class BatteryMonitorService : Service() {
                 return
             }
 
-            val batteryPercent = (level * 100) / scale
+            val currentLevel = (level * 100) / scale
             val isCharging = plugged == BatteryManager.BATTERY_PLUGGED_AC ||
                     plugged == BatteryManager.BATTERY_PLUGGED_USB ||
                     plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
 
-            Log.d(TAG, "Battery Received: $batteryPercent%, Prev: $lastBatteryLevel%, Condition: $condition, Target: $targetPercentage%")
+            Log.d(TAG, "Battery Received: $currentLevel%, Target: $targetPercentage% ($condition)")
 
             // ── Evaluation Logic ──────────────────────────────────────────
             
-            val isFirstRun = lastBatteryLevel == -1
-            val currentLevel = batteryPercent
-            val target = targetPercentage
-            
-            val metCondition = when (condition) {
-                "equals" -> (currentLevel == target) && (isFirstRun || lastBatteryLevel != target)
-                "risesAbove" -> (currentLevel > target) && (!isFirstRun && lastBatteryLevel <= target)
-                "fallsBelow" -> (currentLevel < target) && (!isFirstRun && lastBatteryLevel >= target)
-                else -> false
+            val isFirstRun = (lastBatteryLevel == -1)
+            var shouldTrigger = false
+            val safeCondition = condition.lowercase()
+
+            if (safeCondition.contains("equal")) {
+                shouldTrigger = (currentLevel == targetPercentage) && (isFirstRun || lastBatteryLevel != targetPercentage)
+            } 
+            else if (safeCondition.contains("rise") || safeCondition.contains("above")) {
+                shouldTrigger = (currentLevel > targetPercentage) && (isFirstRun || lastBatteryLevel <= targetPercentage)
+            } 
+            else if (safeCondition.contains("fall") || safeCondition.contains("below")) {
+                shouldTrigger = (currentLevel < targetPercentage) && (isFirstRun || lastBatteryLevel >= targetPercentage)
             }
 
-            // Apply charging constraint
-            var shouldTrigger = metCondition
             if (shouldTrigger && requireCharging && !isCharging) {
                 shouldTrigger = false
             }
 
             if (shouldTrigger) {
-                Log.i(TAG, "Condition met! Triggering FullScreen Alert...")
-                triggerFullScreenAlert()
+                Log.i(TAG, "Condition met! Starting internal countdown...")
+                startInternalTimer(context)
             }
 
-            // Always update state
             lastBatteryLevel = currentLevel
-            
-            // Release WakeLock if held (optional due to timeout)
             if (cpuLock.isHeld) cpuLock.release()
         }
     }
-
-    // ── Service Lifecycle ──────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -118,19 +108,15 @@ class BatteryMonitorService : Service() {
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)
         if (configJson != null) {
             parseTriggerConfig(configJson)
-            // Reset state to allow fresh evaluation
             lastBatteryLevel = -1 
         }
 
-        // ── Start Foreground ──────────────────────────────────────────────
-        // Elevate service priority to prevent it being killed during CPU sleep.
         startForeground(NOTIFICATION_ID, buildForegroundNotification())
 
         val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         registerReceiver(batteryReceiver, filter)
 
-        Log.i(TAG, "BatteryMonitorService (Foreground) started.")
-
+        Log.i(TAG, "BatteryMonitorService (Foreground) active.")
         return START_REDELIVER_INTENT
     }
 
@@ -138,14 +124,10 @@ class BatteryMonitorService : Service() {
         super.onDestroy()
         try {
             unregisterReceiver(batteryReceiver)
-        } catch (e: Exception) {
-            Log.w(TAG, "Unregister receiver failed: ${e.message}")
-        }
+        } catch (e: Exception) {}
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    // ── Configuration ──────────────────────────────────────────────────
 
     private fun parseTriggerConfig(json: String) {
         try {
@@ -161,8 +143,6 @@ class BatteryMonitorService : Service() {
         }
     }
 
-    // ── Notification ───────────────────────────────────────────────────
-
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
@@ -171,17 +151,19 @@ class BatteryMonitorService : Service() {
                 NOTIFICATION_CHANNEL_ID,
                 "Battery Monitor",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Keeps the battery monitoring service active in the background."
-            }
+            )
             manager.createNotificationChannel(monitorChannel)
 
             val alarmChannel = NotificationChannel(
                 ALARM_NOTIFICATION_CHANNEL_ID,
-                "Alarm Alerts",
+                "Critical Alarm Alerts",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
+                description = "Forces screen wake up for battery alerts"
+                setBypassDnd(true)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                enableLights(true)
+                enableVibration(true)
             }
             manager.createNotificationChannel(alarmChannel)
         }
@@ -195,46 +177,64 @@ class BatteryMonitorService : Service() {
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("TaskFlow Active")
-            .setContentText("Monitoring battery level securely in the background.")
+            .setContentText("Monitoring battery securely in the background.")
             .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(pendingIntent)
             .build()
     }
 
-    private fun triggerFullScreenAlert() {
-        val fullScreenIntent = Intent(this, TimerAlertActivity::class.java).apply {
-            putExtra("timerSeconds", timerSeconds)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-
-        val fullScreenPendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            fullScreenIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notificationBuilder = NotificationCompat.Builder(this, ALARM_NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
-            .setContentTitle("TaskFlow Alert!")
-            .setContentText("Battery target reached: $targetPercentage%")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setAutoCancel(true)
-            .setOngoing(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setFullScreenIntent(fullScreenPendingIntent, true)
-
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(ALARM_NOTIFICATION_ID, notificationBuilder.build())
+    /**
+     * Handles the timer countdown internally while holding a WakeLock.
+     * When finished, it blasts a custom high-priority Full-Screen Activity alert.
+     */
+    private fun startInternalTimer(context: Context) {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val countdownLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TaskFlow::CountdownLock")
         
-        try {
-            startActivity(fullScreenIntent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Activity force-start failed: ${e.message}")
-        }
+        // Acquire lock for the duration of the timer + buffer
+        countdownLock.acquire((timerSeconds * 1000L) + 10000L)
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            // 1. Prepare Intent to our custom Alert Activity
+            val alertIntent = Intent(this, TimerAlertActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            
+            val pendingIntent = PendingIntent.getActivity(
+                this, 
+                0, 
+                alertIntent, 
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+            // 2. Build the "Inescapable" Notification
+            val notification = NotificationCompat.Builder(this, ALARM_NOTIFICATION_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle("Bateri Mencapai Sasaran!")
+                .setContentText("Pengecasan tamat. Sila cabut palam.")
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setFullScreenIntent(pendingIntent, true) // CRITICAL for lock screen wake
+                .setAutoCancel(true)
+                .setOngoing(true)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .build()
+
+            val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notifManager.notify(ALARM_NOTIFICATION_ID, notification)
+
+            // 3. Force start activity just in case screen is ON
+            try {
+                startActivity(alertIntent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Force start activity failed: ${e.message}")
+            }
+
+            if (countdownLock.isHeld) countdownLock.release()
+            Log.i(TAG, "Internal countdown finished. Alert triggered.")
+            
+        }, timerSeconds * 1000L)
     }
 }
